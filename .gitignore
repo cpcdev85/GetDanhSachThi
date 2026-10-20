@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+*.pdf
+kmaschedule_settings.json
+kmaschedule_auto_state.json
+kmaschedule_upload_state.json
+pdf_tudong/
