@@ -1,4 +1,4 @@
-# KMA Schedule — Hướng dẫn thiết lập GitHub Actions + cron hosting
+# KMA Schedule - Hướng dẫn thiết lập GitHub Actions + cron hosting
 
 Dự án KMA Schedule được phát triển bởi cPcDev.
 
@@ -281,7 +281,7 @@ Giới hạn tối thiểu 5 phút của lịch `schedule` GitHub không áp d�
 
 Workflow có khóa `concurrency` để không chạy hai lượt cùng lúc. Nếu lượt trước còn chạy, lượt mới phải chờ; cấu hình mặc định không giữ vô hạn tất cả lượt đang chờ. Mức 5 phút phù hợp với nhu cầu theo dõi danh sách thi và giảm tải cho trang nguồn.
 
-## 12. File ghi nhớ — không xóa để thử cron
+## 12. File ghi nhớ - không xóa để thử cron
 
 `json/github_state.json` được tạo/ghi khi có thao tác nhập dữ liệu. File chỉ chứa mã băm, trạng thái và thời gian; không chứa tài khoản admin hoặc danh sách sinh viên.
 
