@@ -97,39 +97,92 @@ class _AdminRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _admin_session(settings):
-    _configure_admin_urls()
-    username = settings.get("admin_username", "").strip()
-    password = settings.get("admin_password", "")
-    if not username or not password:
-        raise ValueError("Thiếu Secrets KMA_ADMIN_USERNAME hoặc KMA_ADMIN_PASSWORD.")
-    if len(username.encode("utf-8")) > 1024 or len(password.encode("utf-8")) > 1024:
-        raise ValueError("Tài khoản hoặc mật khẩu vượt giới hạn của website.")
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), _AdminRedirect())
-    opener.addheaders = [("User-Agent", AUTO_USER_AGENT)]
+class _AdminSession:
+    """Một cookie jar trong RAM; đăng xuất POST + CSRF theo auth.php khi đóng."""
+    def __init__(self, settings):
+        _configure_admin_urls()
+        username = settings.get("admin_username", "").strip()
+        password = settings.get("admin_password", "")
+        if not username or not password:
+            raise ValueError("Thiếu Secrets KMA_ADMIN_USERNAME hoặc KMA_ADMIN_PASSWORD.")
+        if len(username.encode("utf-8")) > 1024 or len(password.encode("utf-8")) > 1024:
+            raise ValueError("Tài khoản hoặc mật khẩu vượt giới hạn của website.")
+        self.cookies = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookies), _AdminRedirect())
+        self.opener.addheaders = [("User-Agent", AUTO_USER_AGENT)]
+        self.last_token = ""
+        self.closed = False
+        try:
+            page = self(ADMIN_LOGIN_URL + "?" + urllib.parse.urlencode({"redirect": ADMIN_REDIRECT_PATH}))
+            if not page.token:
+                raise ValueError("Không tìm thấy CSRF trang đăng nhập; hãy kiểm tra website.")
+            body = urllib.parse.urlencode({"admin_username": username, "admin_password": password,
+                                          "csrf_token": page.token,
+                                          "redirect": ADMIN_REDIRECT_PATH}).encode("utf-8")
+            # Không bật remember-me; không tạo cookie ghi nhớ dài hạn.
+            page = self(ADMIN_LOGIN_URL, body, "application/x-www-form-urlencoded")
+            if page.login or page.message("err"):
+                raise ValueError("Đăng nhập admin thất bại.")
+            page = self(ADMIN_LIST_URL)
+            if page.login or not page.token:
+                raise ValueError("Chưa xác thực được quyền truy cập danh sách thi.")
+            self.token = page.token
+        except BaseException:
+            try:
+                self.logout()
+            except Exception:
+                print("CẢNH BÁO: chưa xác nhận đăng xuất sau lỗi đăng nhập; cookie trong RAM đã được xóa.", flush=True)
+            raise
 
-    def request(url, data=None, content_type=None):
+    def __call__(self, url, data=None, content_type=None):
+        if self.closed:
+            raise ValueError("Phiên admin đã đóng.")
+        target = urllib.parse.urlsplit(url)
+        origin = urllib.parse.urlsplit(ADMIN_ORIGIN)
+        if (target.scheme, target.netloc) != (origin.scheme, origin.netloc):
+            raise ValueError("Đã chặn yêu cầu phiên admin ra ngoài website.")
         headers = {"Referer": ADMIN_LIST_URL, "Origin": ADMIN_ORIGIN}
         if content_type:
             headers["Content-Type"] = content_type
         req = urllib.request.Request(url, data=data, headers=headers)
-        with opener.open(req, timeout=60) as response:
-            return _AdminHTML(response.read().decode("utf-8", errors="replace"))
+        with self.opener.open(req, timeout=60) as response:
+            page = _AdminHTML(response.read().decode("utf-8", errors="replace"))
+        if page.token:
+            self.last_token = page.token
+        return page
 
-    page = request(ADMIN_LOGIN_URL + "?" + urllib.parse.urlencode({"redirect": ADMIN_REDIRECT_PATH}))
-    if not page.token:
-        raise ValueError("Không tìm thấy CSRF trang đăng nhập; hãy kiểm tra website.")
-    body = urllib.parse.urlencode({"admin_username": username, "admin_password": password,
-                                  "csrf_token": page.token,
-                                  "redirect": ADMIN_REDIRECT_PATH}).encode("utf-8")
-    page = request(ADMIN_LOGIN_URL, body, "application/x-www-form-urlencoded")
-    if page.login or page.message("err"):
-        raise ValueError(page.message("err") or "Đăng nhập admin thất bại.")
-    page = request(ADMIN_LIST_URL)
-    if page.login or not page.token:
-        raise ValueError("Chưa xác thực được quyền truy cập danh sách thi.")
-    return request, page.token
+    def logout(self):
+        if self.closed:
+            return
+        try:
+            token = self.last_token
+            try:
+                page = self(ADMIN_LIST_URL)
+            except Exception:
+                # Nếu GET lỗi, vẫn thử POST đăng xuất với token đã biết.
+                if not token:
+                    raise ValueError("Chưa lấy được CSRF để đăng xuất.") from None
+            else:
+                if page.login:
+                    return  # Máy chủ đã xác nhận phiên không còn quyền admin.
+                token = page.token or token
+            if not token:
+                raise ValueError("Thiếu CSRF đăng xuất.")
+            body = urllib.parse.urlencode({"action": "logout", "csrf_token": token}).encode("utf-8")
+            response = self(ADMIN_LIST_URL, body, "application/x-www-form-urlencoded")
+            if not response.login:
+                raise ValueError("Máy chủ chưa xác nhận đăng xuất.")
+        finally:
+            self.cookies.clear()
+            self.last_token = ""
+            self.token = ""
+            self.closed = True
+
+
+def _admin_session(settings):
+    session = _AdminSession(settings)
+    return session, session.token
 
 
 def clean(value):

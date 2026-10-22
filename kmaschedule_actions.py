@@ -31,6 +31,75 @@ class AuthenticationFailure(ValueError):
     pass
 
 
+class PushFailure(ValueError):
+    pass
+
+
+class AdminSessionManager:
+    """Đăng nhập khi cần, dùng chung trong lượt chạy, đăng xuất trong finally."""
+    def __init__(self):
+        self.request = None
+        self.reauthenticated = False
+        self.login_failed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        closed = self.close()
+        if not closed and exc_type is None:
+            raise AuthenticationFailure("Đã xóa cookie trong RAM nhưng máy chủ chưa xác nhận đăng xuất. Kiểm tra kết nối/admin.")
+
+    def get_request(self):
+        if self.login_failed:
+            raise AuthenticationFailure("Đã đăng nhập thất bại; dừng để tránh thử sai liên tục.")
+        if self.request is None:
+            try:
+                self.request, _ = core._admin_session({
+                    "admin_username": os.environ.get("KMA_ADMIN_USERNAME", ""),
+                    "admin_password": os.environ.get("KMA_ADMIN_PASSWORD", "")})
+            except Exception:
+                self.login_failed = True
+                raise AuthenticationFailure("Không đăng nhập được admin; kiểm tra Secrets/kết nối. Dừng lượt chạy.") from None
+        return self.request
+
+    def close(self):
+        if self.request is None:
+            return True
+        request, self.request = self.request, None
+        try:
+            request.logout()
+        except Exception:
+            print("CẢNH BÁO: chưa xác nhận đăng xuất phía máy chủ; cookie trong RAM đã được xóa.", flush=True)
+            return False
+        print("Đã kết thúc phiên admin và xóa cookie trong RAM.", flush=True)
+        return True
+
+    def reauthenticate(self):
+        if self.reauthenticated:
+            raise AuthenticationFailure("Phiên admin tiếp tục hết hạn sau một lần đăng nhập lại; dừng lượt chạy.")
+        self.reauthenticated = True
+        if not self.close():
+            raise AuthenticationFailure("Chưa đóng được phiên admin cũ; dừng đăng nhập lại.")
+        return self.get_request()
+
+    def page(self, target):
+        request = self.get_request()
+        # URL được nạp trong lần đăng nhập đầu tiên, nên chỉ chọn sau get_request.
+        url = core.ADMIN_PUSH_URL if target == "push" else core.ADMIN_LIST_URL
+        page = request(url)
+        # Lỗi mạng/403/thiếu CSRF không đồng nghĩa hết phiên: chỉ đăng nhập lại
+        # khi thực sự nhận trang đăng nhập từ requireLogin() của auth.php.
+        if page.login:
+            request = self.reauthenticate()
+            page = request(url)
+            if page.login:
+                raise AuthenticationFailure("Trang admin vẫn yêu cầu đăng nhập; dừng lượt chạy.")
+        if not page.token:
+            raise ValueError("Không thấy CSRF trên trang admin; không tự đăng nhập lại.")
+        return request, page
+
+
 class GitHubState:
     """Chỉ lưu mã băm, trạng thái và thời gian; ghi bền TRƯỚC POST tới admin."""
     def __init__(self):
@@ -152,57 +221,60 @@ def queue_push_notifications(records, upload_digest, imported_count, store):
     return ""
 
 
-def dispatch_pending_push_notifications(store):
+def dispatch_pending_push_notifications(store, admin=None):
+    if admin is None:
+        with AdminSessionManager() as session:
+            return dispatch_pending_push_notifications(store, session)
     notifications = store.data.setdefault("push_notifications", {})
     uncertain = [key for key, item in notifications.items() if item.get("status") == "sending"]
     pending = [(key, item) for key, item in notifications.items() if item.get("status") == "pending"]
     if uncertain:
-        raise ValueError("Thông báo push trước chưa rõ kết quả; kiểm tra mục Thông báo đẩy trên admin. "
+        raise PushFailure("Thông báo push trước chưa rõ kết quả; kiểm tra mục Thông báo đẩy trên admin. "
                          "Không tự tạo lại. Mã push: " + uncertain[0])
     if not pending:
         return
-    # Có thể thử tạo lại push pending ở lượt sau mà không nhập lại JSON thành công.
-    try:
-        request, _ = core._admin_session({
-            "admin_username": os.environ.get("KMA_ADMIN_USERNAME", ""),
-            "admin_password": os.environ.get("KMA_ADMIN_PASSWORD", "")})
-    except Exception:
-        raise AuthenticationFailure("Chưa đăng nhập được để hẹn push; giữ pending, không nhập lại dữ liệu thành công.") from None
+    # Dùng phiên tải JSON; nếu chỉ có push pending thì đăng nhập khi mở trang.
     for key, entry in pending:
         try:
             exam_date = date.fromisoformat(entry["exam_date"])
         except (KeyError, TypeError, ValueError):
-            raise ValueError("Ngày thi trong ghi nhớ push không hợp lệ; chưa tạo thông báo. Mã push: " + key) from None
+            raise PushFailure("Ngày thi trong ghi nhớ push không hợp lệ; chưa tạo thông báo. Mã push: " + key) from None
         # Chỉ thông báo cho một lần nhập đã có xác nhận thành công.
         if store.data["uploads"].get(entry.get("upload_digest"), {}).get("status") != "success":
-            raise ValueError("Push chưa gắn với dữ liệu nhập thành công; chưa tạo thông báo. Mã push: " + key)
-        page = request(core.ADMIN_PUSH_URL)
-        if page.login or not page.token:
-            raise ValueError("Chưa xác thực được trang Thông báo đẩy; giữ pending để kiểm tra lại.")
-        send_time = planned_send_time()
-        body = urllib.parse.urlencode({"action": "save_push", "push_id": "",
-                                       "csrf_token": page.token, "push_content": push_content(exam_date),
-                                       "send_time": send_time}).encode("utf-8")
-        entry.update(status="sending", send_time=send_time,
-                     time=datetime.now(timezone.utc).isoformat())
-        store.save()  # Nếu lưu thất bại thì không POST tạo thông báo.
-        try:
-            response = request(core.ADMIN_PUSH_URL, body, "application/x-www-form-urlencoded")
-        except Exception:
-            raise ValueError("Chưa rõ kết quả tạo push; không tự tạo lại. Kiểm tra admin. Mã push: " + key) from None
-        if response.login:
-            entry["status"] = "pending"
-            store.save()
-            raise ValueError("Phiên admin hết hạn trước khi tạo push; giữ pending cho lượt sau.")
-        if (response.message("msg-err") or
-                "Đã tạo thông báo đẩy thành công." not in response.message("msg-ok")):
-            raise ValueError("Chưa có xác nhận tạo push; giữ sending. Kiểm tra admin trước khi thử lại. Mã push: " + key)
+            raise PushFailure("Push chưa gắn với dữ liệu nhập thành công; chưa tạo thông báo. Mã push: " + key)
+        while True:
+            request, page = admin.page("push")
+            send_time = planned_send_time()
+            body = urllib.parse.urlencode({"action": "save_push", "push_id": "",
+                                           "csrf_token": page.token, "push_content": push_content(exam_date),
+                                           "send_time": send_time}).encode("utf-8")
+            entry.update(status="sending", send_time=send_time,
+                         time=datetime.now(timezone.utc).isoformat())
+            store.save()  # Nếu lưu thất bại thì không POST tạo thông báo.
+            try:
+                response = request(core.ADMIN_PUSH_URL, body, "application/x-www-form-urlencoded")
+            except Exception:
+                raise PushFailure("Chưa rõ kết quả tạo push; không tự tạo lại. Kiểm tra admin. Mã push: " + key) from None
+            if response.login:
+                # requireLogin() đã chặn trước khi chèn DB: được phép thử lại
+                # sau xác thực, vẫn giới hạn một lần đăng nhập lại trong lượt.
+                entry["status"] = "pending"
+                store.save()
+                admin.reauthenticate()
+                continue
+            if (response.message("msg-err") or
+                    "Đã tạo thông báo đẩy thành công." not in response.message("msg-ok")):
+                raise PushFailure("Chưa có xác nhận tạo push; giữ sending. Kiểm tra admin trước khi thử lại. Mã push: " + key)
+            break
         entry.update(status="scheduled", time=datetime.now(timezone.utc).isoformat())
         store.save()
         print(f"Đã hẹn push cho ngày thi {exam_date.strftime('%d/%m/%Y')}, phát lúc {send_time.replace('T', ' ')} (giờ Việt Nam).", flush=True)
 
 
-def publish(records, batch, pdf_hash, store):
+def publish(records, batch, pdf_hash, store, admin=None):
+    if admin is None:
+        with AdminSessionManager() as session:
+            return publish(records, batch, pdf_hash, store, session)
     digest = fingerprint(json_bytes(records))
     entry = store.data["uploads"].get(digest, {})
     status = entry.get("status")
@@ -213,13 +285,9 @@ def publish(records, batch, pdf_hash, store):
         return
     if status == "sending":
         raise ValueError("Lần tải trước chưa rõ kết quả. Kiểm tra web và xử lý trạng thái theo README. Mã JSON: " + digest)
-    # Bắt buộc xác thực xong trước khi đánh dấu sending.
-    try:
-        request, token = core._admin_session({
-            "admin_username": os.environ.get("KMA_ADMIN_USERNAME", ""),
-            "admin_password": os.environ.get("KMA_ADMIN_PASSWORD", "")})
-    except Exception:
-        raise AuthenticationFailure("Không đăng nhập được admin. Kiểm tra Secrets, mạng hoặc giới hạn đăng nhập; dừng lượt để tránh thử sai liên tục.") from None
+    # Lấy CSRF mới cho từng form, dùng chung cookie cho toàn bộ lượt.
+    request, form = admin.page("list")
+    token = form.token
     store.data["uploads"][digest] = {"status": "sending", "time": datetime.now(timezone.utc).isoformat()}
     store.save()  # Nếu không ghi được lên GitHub thì KHÔNG gửi POST tới website.
     try:
@@ -251,6 +319,11 @@ def publish(records, batch, pdf_hash, store):
 
 
 def run(upload=False, store=None):
+    with AdminSessionManager() as admin:
+        return _run(upload, store, admin)
+
+
+def _run(upload, store, admin):
     store = store or GitHubState()
     errors = 0
     try:
@@ -262,7 +335,7 @@ def run(upload=False, store=None):
     except Exception:
         # Dữ liệu đã nhập ở lượt trước vẫn được hẹn push khi trang trường tạm lỗi.
         if upload:
-            dispatch_pending_push_notifications(store)
+            dispatch_pending_push_notifications(store, admin)
         raise
     for index, url in enumerate(urls, 1):
         try:
@@ -282,10 +355,11 @@ def run(upload=False, store=None):
             batch = core._pdf_file_stem(url)
             print(f"PDF {index}: {len(records)} dòng; mã JSON {fingerprint(json_bytes(records))}.", flush=True)
             if upload:
-                publish(records, batch, pdf_hash, store)
+                publish(records, batch, pdf_hash, store, admin)
+                dispatch_pending_push_notifications(store, admin)
             else:
                 print("Xem thử: không đăng nhập, không tải lên, không đánh dấu đã xử lý.", flush=True)
-        except AuthenticationFailure:
+        except (AuthenticationFailure, PushFailure):
             raise
         except Exception as exc:
             errors += 1
@@ -298,7 +372,7 @@ def run(upload=False, store=None):
                 reason = type(exc).__name__ + "; kiểm tra kết nối hoặc cấu trúc PDF."
             print(f"PDF {index}: LỖI: {reason}", flush=True)
     if upload:
-        dispatch_pending_push_notifications(store)
+        dispatch_pending_push_notifications(store, admin)
     if errors:
         raise ValueError(f"Có {errors} PDF chưa hoàn tất. Xem log phía trên.")
     print("Hoàn tất lượt kiểm tra.", flush=True)
