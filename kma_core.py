@@ -15,11 +15,12 @@ AUTO_USER_AGENT = "Mozilla/5.0 (KMASchedule GitHub Actions)"
 ADMIN_ORIGIN = ""
 ADMIN_LOGIN_URL = ""
 ADMIN_LIST_URL = ""
+ADMIN_PUSH_URL = ""
 ADMIN_REDIRECT_PATH = ""
 
 
 def _configure_admin_urls():
-    global ADMIN_ORIGIN, ADMIN_LOGIN_URL, ADMIN_LIST_URL, ADMIN_REDIRECT_PATH
+    global ADMIN_ORIGIN, ADMIN_LOGIN_URL, ADMIN_LIST_URL, ADMIN_PUSH_URL, ADMIN_REDIRECT_PATH
     value = os.environ.get("KMA_ADMIN_BASE_URL", "").strip().rstrip("/")
     if not value:
         raise ValueError("Thiếu Secret KMA_ADMIN_BASE_URL (URL thư mục admin).")
@@ -42,6 +43,7 @@ def _configure_admin_urls():
     ADMIN_LOGIN_URL = ADMIN_ORIGIN + parsed.path + "/login"
     ADMIN_REDIRECT_PATH = parsed.path + "/lichthi?tab=dsthi"
     ADMIN_LIST_URL = ADMIN_ORIGIN + ADMIN_REDIRECT_PATH
+    ADMIN_PUSH_URL = ADMIN_ORIGIN + parsed.path + "/thongbao"
 
 STUDENT_FIELDS = ("Môn thi", "SBD", "MSV", "Họ và tên", "Lần thi", "Ngày thi", "Ca thi", "Phòng")
 STUDENT_HEADERS = ("SBD", "Mã HVSV", "Họ đệm", "Tên", "Lần thi", "Ngày thi", "Ca thi", "Phòng")
